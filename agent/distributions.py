@@ -26,7 +26,7 @@ class DiagGaussian(object):
     def prob(self, x):
         return tf.exp(-self.neglogp(x))
 
-    def logprob(self, x):
+    def log_prob(self, x):
         return -self.neglogp(x)
 
         
