@@ -16,33 +16,34 @@ class ParkingEnv(gym.Env):
         self.window_size = np.array([600, 600])
 
         # parking lot cordinates
-        lot_center = np.array([150, 100])
+        self._lot_center = np.array([150, 100])
         lot_size = np.array([70, 120])
-        self._lot_left = lot_center[0] - lot_size[0]//2
-        self._lot_right = lot_center[0] + lot_size[0]//2
-        self._lot_top = lot_center[1] + lot_size[1]//2
-        self._lot_bottom = lot_center[1] - lot_size[1]//2
+        self._lot_left = self._lot_center[0] - lot_size[0]//2
+        self._lot_right = self._lot_center[0] + lot_size[0]//2
+        self._lot_top = self._lot_center[1] + lot_size[1]//2
+        self._lot_bottom = self._lot_center[1] - lot_size[1]//2
 
         # car info
         self._car_size = np.array([50, 100])
-        self._target_lb = np.array([lot_center[0] - self._car_size[0]//2,\
-            lot_center[1] - self._car_size[1]//2])
-        self._target_rb = np.array([lot_center[0] + self._car_size[0]//2, self._target_lb[1]])
-        self._target_lt = np.array([self._target_lb[0], lot_center[1] + self._car_size[1]//2])
+        self._target_lb = np.array([self._lot_center[0] - self._car_size[0]//2,\
+            self._lot_center[1] - self._car_size[1]//2])
+        self._target_rb = np.array([self._lot_center[0] + self._car_size[0]//2, self._target_lb[1]])
+        self._target_lt = np.array([self._target_lb[0], self._lot_center[1] + self._car_size[1]//2])
         self._target_rt = np.array([self._target_rb[0], self._target_lt[1]])
 
         # state (car center x, car center y, car orientation)
-        self.low_state = np.array([0., 0., 0.])
-        self.high_state = np.array([*self.window_size, 2*np.pi])
-        self.observation_space = spaces.Box(low=self.low_state, high=self.high_state, dtype=np.float32)
+        low_state = np.array([0., 0., 0.])
+        high_state = np.array([*self.window_size, 2*np.pi])
+        self.observation_space = spaces.Box(low=low_state, high=high_state, dtype=np.float32)
 
         # action (inner wheel angle)
         max_wheel_angle = np.pi * 40./180
-        self.action_space = spaces.Box(low=-max_wheel_angle, high=max_wheel_angle, \
-        shape=(1,), dtype=np.float32)
+        low_action = np.array([-max_wheel_angle, -2.])
+        high_action = np.array([max_wheel_angle, 2.])
+        self.action_space = spaces.Box(low=low_action, high=high_action, dtype=np.float32)
 
         # ds per frame
-        self.spf = -2.
+        # self.spf = -2.
 
         self.viewer = None
         self.seed()
@@ -78,11 +79,13 @@ class ParkingEnv(gym.Env):
         # rand_y = self.np_random.uniform(low=250., high=350.)
         # rand_theta = self.np_random.uniform(low=np.pi/3, high=2*np.pi/3)
         # self.state = np.array([rand_x, rand_y, rand_theta])
-        self.state = np.array([400., 400., np.pi/2])
+        self.init_x = 400.
+        self.init_y = 400.
+        self.state = np.array([self.init_x, self.init_y, np.pi/2])
         
         self._calc_vertex(self.state)
 
-        self._last_action = 0.
+        self._last_action = np.array([0., 0.])
         self.steps = 0
         return self.state
 
@@ -96,7 +99,7 @@ class ParkingEnv(gym.Env):
             return True
 
         # check lot right
-        if max(line_start[0], line_end[0]) >= self._lot_left:
+        if max(line_start[0], line_end[0]) >= self._lot_right:
             return True
 
         # check lot bottom
@@ -165,7 +168,7 @@ class ParkingEnv(gym.Env):
         if alpha > 1e-3:
             w, h = self._car_size
             beta = np.arctan2(h, h/np.tan(alpha) + w)
-            self.dtheta = self.spf*np.sin(alpha)/h
+            self.dtheta = action[1]*np.sin(alpha)/h
             if not turn_left:
                 alpha, beta = beta, alpha
             ds_lt = self._calc_top_ds(alpha, turn_left)
@@ -173,7 +176,7 @@ class ParkingEnv(gym.Env):
             ds_lb = self._calc_bottom_ds(alpha, turn_left)
             ds_rb = self._calc_bottom_ds(beta, turn_left)
         else:
-            ds_lt = np.array([0, self.spf])
+            ds_lt = np.array([0, action[1]])
             ds_rt = ds_lt.copy()
             ds_lb = ds_lt.copy()
             ds_rb = ds_lt.copy()
@@ -192,20 +195,33 @@ class ParkingEnv(gym.Env):
         self.state = next_state
         # self._calc_vertex(next_state)
             
-        # calc distance
-        #  + \
-        #     np.linalg.norm(self._car_lt - self._target_lt) + \
-        #     np.linalg.norm(self._car_rt - self._target_rt)
-        distance = (np.linalg.norm(self._car_lb - self._target_lb) + \
-            np.linalg.norm(self._car_rb - self._target_rb))/2
-        reward = 10 - 0.05 * distance
+        reward, done = self._get_reward(next_state, action)
+
+        return self.state, reward, done, {}
+
+    def _get_reward(self, state, action):
+        horizontal_err = abs(self.state[0] - self._lot_center[0])/\
+            abs(self.init_x - self._lot_center[0])
+
+        vertical_err = abs(self.state[1] - self._lot_center[1])/\
+            abs(self.init_y - self._lot_center[1])
+
+        theta_err = state[2]
+        if theta_err > np.pi:
+            theta_err = 2*np.pi - theta_err
+        theta_err /= np.pi
+
+        reward = 1 - 0.3*horizontal_err - 0.2*vertical_err - 0.5*theta_err
+        if action[1] * self._last_action[1] < 0:
+            reward -= 1
 
         # check done
         self.steps += 1
         if self._check_collision():
-            # reward -= 10
+            reward -= 1
             done = True
-        elif distance <= 1:
+        elif state[1] <= self._lot_center[1]:
+            reward += 10
             done = True
         elif self.steps >= 500:
             done = True
@@ -216,7 +232,9 @@ class ParkingEnv(gym.Env):
         # if steering_angle > 3.5:
         #     reward -= 0.05 * steering_angle
 
-        return self.state, reward, done, {}
+        self._last_action = action
+
+        return reward, done
 
     def render(self, mode='human'):
         screen_width = self.window_size[0]
@@ -248,7 +266,25 @@ class ParkingEnv(gym.Env):
             car.add_attr(self._cartrans)
             self.viewer.add_geom(car)
 
-            # test
+            # target vertex
+            target_lb = rendering.make_circle(5)
+            target_rb = rendering.make_circle(5)
+            target_lt = rendering.make_circle(5)
+            target_rt = rendering.make_circle(5)
+            target_lb.set_color(0, 0, 255)
+            target_rb.set_color(0, 0, 255)
+            target_lt.set_color(0, 0, 255)
+            target_rt.set_color(0, 0, 255)
+            target_lb.add_attr(rendering.Transform(translation=(self._target_lb[0], self._target_lb[1])))
+            target_rb.add_attr(rendering.Transform(translation=(self._target_rb[0], self._target_rb[1])))
+            target_lt.add_attr(rendering.Transform(translation=(self._target_lt[0], self._target_lt[1])))
+            target_rt.add_attr(rendering.Transform(translation=(self._target_rt[0], self._target_rt[1])))
+            self.viewer.add_geom(target_lb)
+            self.viewer.add_geom(target_rb)
+            self.viewer.add_geom(target_lt)
+            self.viewer.add_geom(target_rt)
+            
+            # tracking vertex
             point_lb = rendering.make_circle(5)
             point_lt = rendering.make_circle(5)
             point_rb = rendering.make_circle(5)
