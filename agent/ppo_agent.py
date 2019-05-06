@@ -23,11 +23,11 @@ class PPOAgent:
         self.batch_size = 64
 
         # network parameters
-        hidden_size = 64
+        hidden_size = 32
         learning_rate = 1e-3
         vf_coef = 0.5
-        entropy_coef = 0.01
-        layer_num = 2
+        entropy_coef = 0
+        layer_num = 1
 
         # get size
         self.state_size = int(np.prod(np.array(env.observation_space.shape)))
@@ -41,11 +41,8 @@ class PPOAgent:
             self.action_size = env.action_space.nvec
         elif isinstance(env.action_space, gym.spaces.MultiBinary):
             self.action_size = env.action_space.n
-        
-        self.action_low = env.action_space.low
-        self.action_high = env.action_space.high
 
-        self.policy = PPO(self.state_size, self.action_size, self.action_low, self.action_high,
+        self.policy = PPO(self.state_size, self.action_size,
             update_steps, continuous, learning_rate, vf_coef, entropy_coef)
 
         self.rewards_list = []
@@ -106,7 +103,10 @@ class PPOAgent:
 
             t += 1
     
-    def train(self, save_dir, plot_curv=True, render=False):
+    def train(self, save_dir, plot_curv=True, render=False, load_weights=False):
+        if load_weights:
+            self.policy.load_weights(save_dir)
+        
         gen = self.data_generator(render=render)
 
         while len(self.rewards_list) < self.train_episodes:
@@ -154,8 +154,6 @@ class PPO(object):
     def __init__(self,
         state_size,
         action_size,
-        action_low,
-        action_high,
         update_steps,
         continuous,
         learning_rate,
@@ -163,11 +161,8 @@ class PPO(object):
         entropy_coef,
         clip_ratio=0.2):
 
-        self._action_low = action_low
-        self._action_high = action_high
         self._update_steps = update_steps
-        
-        self._model = mlp_model(state_size, action_size)
+        self._model = mlp_model(state_size, action_size, continuous=continuous)
         self._build_func(continuous, clip_ratio, vf_coef, entropy_coef, learning_rate)
     
     def _build_func(self, continuous, clip_ratio, vf_coef, entropy_coef, learning_rate):
@@ -240,10 +235,7 @@ class PPO(object):
             state = state[None, :]
 
         act, logpi, value = self._pred([state])
-        act = np.clip(act, self._action_low, self._action_high)
-        if act.ndim > 1:
-            act = np.squeeze(act, axis=0)
-            
+        act = np.squeeze(act, axis=0)
         # logpi = np.squeeze(logpi, axis=0)
 
         return act, logpi, value
