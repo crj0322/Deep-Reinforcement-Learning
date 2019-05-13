@@ -7,27 +7,26 @@ from keras.optimizers import Adam
 import keras.backend as K
 from agent.model import mlp_model
 from agent.distributions import DiagGaussian
-from agent.utils import RunningMeanStd, plot_training_curv, save_frames_as_gif
+from agent.utils import RunningMeanStd, plot_training_curv, save_frames_as_gif, callback
 
 
 class PPOAgent:
     def __init__(self, env):
         self.env = env
 
-        self.train_episodes = 2000
+        self.train_episodes = 1000
         self.max_steps = 200
         self.gamma = 0.9
 
         # Update parameters
         update_steps = 10
         self.batch_size = 64
+        self.solved_condition = lambda x: callback(x, 0.)
 
         # network parameters
-        hidden_size = 32
         learning_rate = 1e-3
-        vf_coef = 0.5
+        vf_coef = 2.
         entropy_coef = 0
-        layer_num = 1
 
         # get size
         self.state_size = int(np.prod(np.array(env.observation_space.shape)))
@@ -49,17 +48,16 @@ class PPOAgent:
         
     def data_generator(self, render):
         states = np.zeros([self.batch_size, self.state_size], 'float32')
+        actions = np.zeros([self.batch_size, self.action_size], 'float32')
         logpis = np.zeros(self.batch_size, 'float32')
         rewards = np.zeros(self.batch_size, 'float32')
         advantages = np.zeros(self.batch_size, 'float32')
         dones = np.zeros(self.batch_size + 1, 'int32')
         values = np.zeros(self.batch_size + 1, 'float32')
-        
-        r_norm = RunningMeanStd(shape=(1,))
 
         state = self.env.reset()
         total_reward = 0
-        t = 0
+        step = 0
         while True:
             if render:
                 self.env.render()
@@ -68,10 +66,9 @@ class PPOAgent:
             next_state, reward, done, _ = self.env.step(action)
 
             # yield batch
-            if (t + 1) % self.batch_size == 0:
+            if step and step % self.batch_size == 0:
                 # normalize reward
-                r_norm.update(rewards)
-                rewards = r_norm.normalize(rewards)
+                # rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-6)
 
                 # calculate advantage
                 dones[i + 1] = done
@@ -83,16 +80,20 @@ class PPOAgent:
                     advantages[t] = last_adv = delta + self.gamma * nonterminal * last_adv
 
                 gains = advantages + values[0:-1]
-                yield states, logpis, advantages, gains
 
-            i = t % self.batch_size
+                # batch-normalize advantages
+                # advantages = (advantages - advantages.mean())/(advantages.std()+1e-6)
+                yield states, actions, logpis, advantages, gains
+
+            i = step % self.batch_size
             states[i] = state
+            actions[i] = action
             logpis[i] = logpi
             rewards[i] = reward
             values[i] = value
             dones[i] = done
             total_reward += reward
-            if done or ((t + 1) % self.max_steps == 0):
+            if done or ((step + 1) % self.max_steps == 0):
                 state = self.env.reset()
                 self.rewards_list.append((len(self.rewards_list), total_reward))
                 print('Episode: {}'.format(len(self.rewards_list)),
@@ -101,7 +102,7 @@ class PPOAgent:
             else:
                 state = next_state
 
-            t += 1
+            step += 1
     
     def train(self, save_dir, plot_curv=True, render=False, load_weights=False):
         if load_weights:
@@ -110,10 +111,15 @@ class PPOAgent:
         gen = self.data_generator(render=render)
 
         while len(self.rewards_list) < self.train_episodes:
-            states, logpis, advantages, gains = next(gen)
+        # while True:
+            states, actions, logpis, advantages, gains = next(gen)
             actor_loss, critic_loss = \
-                self.policy.update(states, advantages, gains, logpis)
+                self.policy.update(states, advantages, gains, actions, logpis)
 
+            # solved condition
+            # if self.solved_condition and self.solved_condition(self.rewards_list):
+            #     break
+            
             # check
             import math
             if math.isnan(actor_loss) or math.isnan(critic_loss):
@@ -162,10 +168,12 @@ class PPO(object):
         clip_ratio=0.2):
 
         self._update_steps = update_steps
-        self._model = mlp_model(state_size, action_size, continuous=continuous)
-        self._build_func(continuous, clip_ratio, vf_coef, entropy_coef, learning_rate)
+        self._model = mlp_model(state_size, action_size, 
+            state_scale=True, state_shift=True,
+            continuous=continuous, value_separate=True)
+        self._build_func(action_size, continuous, clip_ratio, vf_coef, entropy_coef, learning_rate)
     
-    def _build_func(self, continuous, clip_ratio, vf_coef, entropy_coef, learning_rate):
+    def _build_func(self, action_size, continuous, clip_ratio, vf_coef, entropy_coef, learning_rate):
         state = self._model.inputs[0]
         logits, value = self._model.outputs
 
@@ -186,12 +194,13 @@ class PPO(object):
         self._pred = K.function([state], [sample, logpi, value])
 
         # calculate loss
+        action_old = tf.placeholder(tf.float32, [None, action_size], name="action_old")
         adv = tf.placeholder(tf.float32, [None], name="advantage")
         gain = tf.placeholder(tf.float32, [None], name="gain")
         logpi_old = tf.placeholder(tf.float32, [None], name="logpi_old")
 
         # policy loss
-        ratio = tf.exp(logpi - logpi_old)
+        ratio = tf.exp(pi.log_prob(action_old) - logpi_old)
         surr1 = ratio * adv
         surr2 = tf.clip_by_value(ratio, 1.0 - clip_ratio, 1.0 + clip_ratio) * adv
         pi_loss = - tf.reduce_mean(tf.minimum(surr1, surr2))
@@ -209,17 +218,14 @@ class PPO(object):
             params=self._model.trainable_weights,
             loss=loss)
         self._train_fn = K.function(
-            inputs=[state, adv, gain, logpi_old],
+            inputs=[state, adv, gain, action_old, logpi_old],
             outputs=[pi_loss, vf_loss, entropy_loss],
             updates=updates_op)
 
-    def update(self, state, adv, gain, old_logpi):
-        # batch-normalize advantages
-        adv = (adv - adv.mean())/(adv.std()+1e-6)
-
+    def update(self, state, adv, gain, ac_old, logpi_old):
         # update actor critic
         for _ in range(self._update_steps):
-            actor_loss, critic_loss, _ = self._train_fn([state, adv, gain, old_logpi])
+            actor_loss, critic_loss, _ = self._train_fn([state, adv, gain, ac_old, logpi_old])
 
             # check
             import math
